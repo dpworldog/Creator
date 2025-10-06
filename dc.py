@@ -509,6 +509,101 @@ class RazorCloudBot(commands.Bot):
         logging.info(f'🚀 {Config.BRAND_NAME} Bot is online as {self.user}')
         activity = discord.Activity(type=discord.ActivityType.watching, name=f"VPS Services | {Config.BRAND_NAME}")
         await self.change_presence(activity=activity)
+        
+        # Start payment monitoring task
+        if not self.payment_monitor.is_running():
+            self.payment_monitor.start()
+            logging.info("💳 Payment monitoring system started")
+    
+    @tasks.loop(minutes=2)  # Check every 2 minutes
+    async def payment_monitor(self):
+        """Monitor pending payments and auto-deploy VPS when paid"""
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute('SELECT oxapay_id, user_id, plan_name, amount FROM payments WHERE status = "pending"')
+            pending_payments = cursor.fetchall()
+            
+            for payment in pending_payments:
+                oxapay_id, user_id, plan_name, amount = payment
+                
+                # Check payment status with OxaPay
+                verification = await self.oxapay.verify_payment(oxapay_id)
+                
+                if verification["success"] and verification["paid"]:
+                    logging.info(f"💳 Payment {oxapay_id} confirmed! Auto-deploying VPS for user {user_id}")
+                    
+                    # Deploy VPS automatically
+                    await self.auto_deploy_vps(oxapay_id, user_id, plan_name)
+                    
+        except Exception as e:
+            logging.error(f"Payment monitor error: {e}")
+    
+    async def auto_deploy_vps(self, oxapay_id: str, user_id: int, plan_name: str):
+        """Automatically deploy VPS after payment confirmation"""
+        try:
+            # Deploy VPS
+            plan_config = Config.TEMPLATES[plan_name].copy()
+            plan_config['plan_name'] = plan_name
+            result = await self.proxmox.create_container(plan_config, user_id)
+            
+            if result["success"]:
+                # Save VPS to database
+                self.db.create_vps(
+                    user_id,
+                    result["vm_id"],
+                    plan_name,
+                    result["hostname"],
+                    result["tmate_session"],
+                    result["tmate_ro_session"]
+                )
+                
+                # Update payment status
+                cursor = self.db.conn.cursor()
+                cursor.execute('UPDATE payments SET status = "completed" WHERE oxapay_id = ?', (oxapay_id,))
+                self.db.conn.commit()
+                
+                # Notify user
+                try:
+                    user = await self.fetch_user(user_id)
+                    success_embed = create_razor_embed("Payment Confirmed! VPS Ready! 🎉", "Your VPS has been automatically deployed", 0x00FF00)
+                    success_embed.add_field(name="📦 Plan", value=plan_name.title(), inline=True)
+                    success_embed.add_field(name="🆔 VM ID", value=result["vm_id"], inline=True)
+                    success_embed.add_field(name="🌐 Hostname", value=result["hostname"], inline=True)
+                    
+                    # Tmate sessions
+                    success_embed.add_field(
+                        name="🔑 Tmate Read-Write", 
+                        value=f"```{result['tmate_session']}```",
+                        inline=False
+                    )
+                    success_embed.add_field(
+                        name="👀 Tmate Read-Only", 
+                        value=f"```{result['tmate_ro_session']}```",
+                        inline=False
+                    )
+                    success_embed.add_field(
+                        name="🌐 Web Interface", 
+                        value=f"[Click Here]({result['tmate_web']})",
+                        inline=True
+                    )
+                    
+                    success_embed.add_field(
+                        name="🚀 Getting Started",
+                        value="Your VPS is ready! Copy the Tmate command and paste it in your terminal to connect instantly!",
+                        inline=False
+                    )
+                    
+                    await user.send(embed=success_embed)
+                    logging.info(f"✅ VPS deployed and user {user_id} notified for payment {oxapay_id}")
+                    
+                except Exception as e:
+                    logging.error(f"Failed to notify user {user_id}: {e}")
+                
+            else:
+                logging.error(f"VPS deployment failed for payment {oxapay_id}: {result['error']}")
+                
+        except Exception as e:
+            logging.error(f"Auto-deploy error for payment {oxapay_id}: {e}")
 
 # Initialize bot
 bot = RazorCloudBot()
@@ -539,6 +634,10 @@ async def help(ctx):
     `!buy professional` - Buy Professional plan ($16)
     `!buy enterprise` - Buy Enterprise plan ($22)
     `!buy elite` - Buy Elite plan ($31)
+    
+    **💳 Payment**
+    `!checkpay` - Check your pending payments
+    `!checkpay <track_id>` - Check specific payment & deploy VPS
     
     **🔧 Management**
     `!manage` - Your VPS list
@@ -723,7 +822,7 @@ async def buy(ctx, plan_name: str = None):
         payment_embed = create_razor_embed("Payment Required 💳", f"Complete payment for **{plan_name}** plan", 0x9B59B6)
         payment_embed.add_field(name="💰 Amount", value=f"${price}", inline=True)
         payment_embed.add_field(name="📦 Plan", value=plan_name.title(), inline=True)
-        payment_embed.add_field(name="📄 Invoice ID", value=payment_result["invoice_id"], inline=True)
+        payment_embed.add_field(name="🔍 Track ID", value=f"`{payment_result['oxapay_id']}`", inline=True)
         payment_embed.add_field(
             name="🔗 Payment Link", 
             value=f"[Click to Pay]({payment_result.get('payment_url', '#')})",
@@ -731,7 +830,7 @@ async def buy(ctx, plan_name: str = None):
         )
         payment_embed.add_field(
             name="⏰ Next Steps",
-            value="1. Complete the payment\n2. Admin will verify payment\n3. Receive VPS credentials in DMs",
+            value="1. Complete the payment using the link above\n2. Use `!checkpay` to see your payments\n3. Use `!checkpay <track_id>` to deploy VPS after payment\n4. VPS will auto-deploy within 2 minutes (or use checkpay for instant)",
             inline=False
         )
         
@@ -934,6 +1033,69 @@ async def tmate(ctx, vm_id: int = None):
     
     await ctx.author.send(embed=embed)
     await ctx.send("✅ Check your DMs for Tmate sessions!")
+
+@bot.command()
+async def checkpay(ctx, track_id: str = None):
+    """Check your payment status and trigger VPS deployment if paid"""
+    if not track_id:
+        # Show user's pending payments
+        cursor = bot.db.conn.cursor()
+        cursor.execute('SELECT oxapay_id, plan_name, amount, created_at FROM payments WHERE user_id = ? AND status = "pending"', (ctx.author.id,))
+        pending = cursor.fetchall()
+        
+        if not pending:
+            await ctx.send("❌ You don't have any pending payments.")
+            return
+        
+        embed = create_razor_embed("Your Pending Payments", "Use `!checkpay <track_id>` to check status")
+        for payment in pending:
+            oxapay_id, plan_name, amount, created_at = payment
+            embed.add_field(
+                name=f"💳 {plan_name.title()} - ${amount}",
+                value=f"Track ID: `{oxapay_id}`\nCreated: {created_at}",
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    # Check specific payment
+    cursor = bot.db.conn.cursor()
+    cursor.execute('SELECT user_id, plan_name, amount FROM payments WHERE oxapay_id = ? AND user_id = ?', (track_id, ctx.author.id))
+    payment_data = cursor.fetchone()
+    
+    if not payment_data:
+        await ctx.send("❌ Payment not found or you don't have access to it.")
+        return
+    
+    user_id, plan_name, amount = payment_data
+    
+    embed = create_razor_embed("Checking Payment...", f"Verifying payment status for {track_id}", 0x00FF9D)
+    msg = await ctx.send(embed=embed)
+    
+    # Verify payment with OxaPay
+    verification = await bot.oxapay.verify_payment(track_id)
+    
+    if verification["success"]:
+        if verification["paid"]:
+            # Payment confirmed, deploy VPS
+            embed = create_razor_embed("Payment Confirmed! 🎉", "Deploying your VPS now...", 0x00FF9D)
+            await msg.edit(embed=embed)
+            
+            # Deploy VPS
+            await bot.auto_deploy_vps(track_id, user_id, plan_name)
+            
+            embed = create_razor_embed("VPS Deployed! ✅", "Check your DMs for VPS credentials!", 0x00FF00)
+            await msg.edit(embed=embed)
+            
+        else:
+            embed = create_razor_embed("Payment Pending ⏳", 
+                                     f"Payment {track_id} is still unpaid. Please complete the payment.", 0xFFD700)
+            await msg.edit(embed=embed)
+    else:
+        embed = create_razor_embed("Payment Check Failed ❌", 
+                                 f"Could not verify payment: {verification['error']}", 0xFF0000)
+        await msg.edit(embed=embed)
 
 @bot.command()
 async def status(ctx):
