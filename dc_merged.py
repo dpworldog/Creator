@@ -363,9 +363,12 @@ class ProxmoxManager:
                 'net0': 'name=eth0,bridge=vmbr0,ip=dhcp',
                 'password': 'razorcloud123',
                 'unprivileged': '1',
-                'start': '1',
+                'start': '0',  # Don't start immediately, configure first
                 'onboot': '1',
-                'node': 'pve'  # Specify the node explicitly
+                'node': 'pve',  # Specify the node explicitly
+                # AppArmor configuration for proper container operation
+                'lxc.apparmor.profile': 'unconfined',
+                'lxc.apparmor.allow_nesting': '1'
             }
             
             logging.info(f"LXC config: {container_config}")
@@ -382,6 +385,9 @@ class ProxmoxManager:
                     
                     if response.status == 200:
                         logging.info(f"LXC container {vm_id} created successfully")
+                        
+                        # Configure AppArmor for proper container operation
+                        await self.configure_apparmor(vm_id, auth_data)
                         
                         # Wait a bit for container to start
                         await asyncio.sleep(15)
@@ -402,6 +408,46 @@ class ProxmoxManager:
                         
         except Exception as e:
             logging.error(f"LXC creation error: {e}")
+            return False
+    
+    async def configure_apparmor(self, vm_id: int, auth_data: dict) -> bool:
+        """Start the LXC container with AppArmor configuration"""
+        try:
+            ticket = auth_data['ticket']
+            csrf_token = auth_data['csrf_token']
+            
+            logging.info(f"Starting container {vm_id} with AppArmor configuration")
+            
+            connector = aiohttp.TCPConnector(ssl=self.ssl_context)
+            timeout = aiohttp.ClientTimeout(total=60)
+            
+            headers = {
+                'Cookie': f'PVEAuthCookie={ticket}',
+                'CSRFPreventionToken': csrf_token,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            # Start the container
+            start_data = {}
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/nodes/pve/lxc/{vm_id}/status/start",
+                    headers=headers,
+                    data=start_data
+                ) as response:
+                    
+                    response_text = await response.text()
+                    
+                    if response.status == 200:
+                        logging.info(f"Container {vm_id} started successfully with AppArmor unconfined")
+                        return True
+                    else:
+                        logging.warning(f"Failed to start container {vm_id}: {response.status} - {response_text}")
+                        return False
+                
+        except Exception as e:
+            logging.error(f"Container start error for {vm_id}: {e}")
             return False
     
     async def setup_tmate_in_container(self, vm_id: int, auth_data: dict) -> bool:
