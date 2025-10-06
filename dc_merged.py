@@ -256,8 +256,8 @@ class ProxmoxManager:
         random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         return f"{prefix}-{random_suffix}.{Config.BRAND_NAME.lower()}.com"
     
-    async def authenticate(self) -> str:
-        """Authenticate with Proxmox and get ticket"""
+    async def authenticate(self) -> dict:
+        """Authenticate with Proxmox and get ticket + CSRF token"""
         try:
             connector = aiohttp.TCPConnector(ssl=self.ssl_context)
             timeout = aiohttp.ClientTimeout(total=30)
@@ -274,9 +274,13 @@ class ProxmoxManager:
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
-                        return data['data']['ticket']
+                        return {
+                            'ticket': data['data']['ticket'],
+                            'csrf_token': data['data']['CSRFPreventionToken']
+                        }
                     else:
-                        logging.error(f"Authentication failed: {response.status}")
+                        response_text = await response.text()
+                        logging.error(f"Authentication failed: {response.status} - {response_text}")
                         return None
         except Exception as e:
             logging.error(f"Authentication error: {e}")
@@ -286,17 +290,20 @@ class ProxmoxManager:
         """Get next available VM ID from Proxmox"""
         try:
             # First authenticate
-            ticket = await self.authenticate()
-            if not ticket:
+            auth_data = await self.authenticate()
+            if not auth_data:
                 logging.warning("Authentication failed, generating random VM ID")
                 return random.randint(100, 9999)
+            
+            ticket = auth_data['ticket']
+            csrf_token = auth_data['csrf_token']
             
             connector = aiohttp.TCPConnector(ssl=self.ssl_context)
             timeout = aiohttp.ClientTimeout(total=30)
             
             headers = {
                 'Cookie': f'PVEAuthCookie={ticket}',
-                'CSRFPreventionToken': ticket
+                'CSRFPreventionToken': csrf_token
             }
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -325,33 +332,43 @@ class ProxmoxManager:
     async def create_lxc_container(self, vm_id: int, plan_config: dict, hostname: str) -> bool:
         """Create actual LXC container via Proxmox API"""
         try:
-            ticket = await self.authenticate()
-            if not ticket:
+            # Get fresh authentication ticket for LXC creation
+            auth_data = await self.authenticate()
+            if not auth_data:
+                logging.error("Failed to get authentication ticket for LXC creation")
                 return False
             
+            ticket = auth_data['ticket']
+            csrf_token = auth_data['csrf_token']
+            
+            logging.info(f"Creating LXC container {vm_id} with authentication ticket")
+            
             connector = aiohttp.TCPConnector(ssl=self.ssl_context)
-            timeout = aiohttp.ClientTimeout(total=60)
+            timeout = aiohttp.ClientTimeout(total=120)  # Increased timeout
             
             headers = {
                 'Cookie': f'PVEAuthCookie={ticket}',
-                'CSRFPreventionToken': ticket,
+                'CSRFPreventionToken': csrf_token,
                 'Content-Type': 'application/x-www-form-urlencoded'
             }
             
             # LXC container configuration
             container_config = {
-                'vmid': vm_id,
+                'vmid': str(vm_id),
                 'hostname': hostname,
-                'memory': plan_config['ram'],
-                'cores': plan_config['cores'],
+                'memory': str(plan_config['ram']),
+                'cores': str(plan_config['cores']),
                 'rootfs': f'local-lvm:{plan_config["disk"]}',
                 'ostemplate': 'local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst',
                 'net0': 'name=eth0,bridge=vmbr0,ip=dhcp',
                 'password': 'razorcloud123',
-                'unprivileged': 1,
-                'start': 1,
-                'onboot': 1
+                'unprivileged': '1',
+                'start': '1',
+                'onboot': '1',
+                'node': 'pve'  # Specify the node explicitly
             }
+            
+            logging.info(f"LXC config: {container_config}")
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.post(
@@ -359,33 +376,46 @@ class ProxmoxManager:
                     headers=headers,
                     data=container_config
                 ) as response:
+                    
+                    response_text = await response.text()
+                    logging.info(f"LXC creation response: Status={response.status}, Body={response_text}")
+                    
                     if response.status == 200:
                         logging.info(f"LXC container {vm_id} created successfully")
                         
                         # Wait a bit for container to start
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(15)
                         
-                        # Install and configure Tmate in the container
-                        await self.setup_tmate_in_container(vm_id, ticket)
+                        # Try to install Tmate in the container (optional)
+                        try:
+                            await self.setup_tmate_in_container(vm_id, auth_data)
+                        except Exception as e:
+                            logging.warning(f"Tmate setup failed in container {vm_id}: {e}")
                         
                         return True
+                    elif response.status == 401:
+                        logging.error(f"Authentication failed for LXC creation: {response_text}")
+                        return False
                     else:
-                        logging.error(f"Failed to create LXC container: {response.status}")
+                        logging.error(f"Failed to create LXC container: {response.status} - {response_text}")
                         return False
                         
         except Exception as e:
             logging.error(f"LXC creation error: {e}")
             return False
     
-    async def setup_tmate_in_container(self, vm_id: int, ticket: str) -> bool:
+    async def setup_tmate_in_container(self, vm_id: int, auth_data: dict) -> bool:
         """Install and configure Tmate inside the LXC container"""
         try:
+            ticket = auth_data['ticket']
+            csrf_token = auth_data['csrf_token']
+            
             connector = aiohttp.TCPConnector(ssl=self.ssl_context)
             timeout = aiohttp.ClientTimeout(total=120)
             
             headers = {
                 'Cookie': f'PVEAuthCookie={ticket}',
-                'CSRFPreventionToken': ticket,
+                'CSRFPreventionToken': csrf_token,
                 'Content-Type': 'application/x-www-form-urlencoded'
             }
             
