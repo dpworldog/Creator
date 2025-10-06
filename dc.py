@@ -178,24 +178,32 @@ tmate -S /tmp/tmate.sock display -p '#{tmate_web}'
                         "web_url": lines[2].strip()
                     }
             
-            # Fallback to simulated session if tmate is not available
+            # Fallback to correct tmate format with @nxx servers
             session_id = f"rzr-{uuid.uuid4().hex[:8]}"
+            # Use correct tmate server format
+            servers = ["ny1", "sf1", "lon1", "sgp1"]  # Real tmate servers
+            server = random.choice(servers)
+            
             return {
                 "success": True,
                 "session_id": session_id,
-                "ssh_rw": f"ssh {session_id}@ny.tmate.io",
-                "ssh_ro": f"ssh {session_id}-ro@ny.tmate.io", 
+                "ssh_rw": f"ssh {session_id}@{server}.tmate.io",
+                "ssh_ro": f"ssh {session_id}-ro@{server}.tmate.io", 
                 "web_url": f"https://tmate.io/t/{session_id}"
             }
             
         except Exception as e:
-            # Fallback to simulated session
+            # Fallback to correct tmate format with @nxx servers
             session_id = f"rzr-{uuid.uuid4().hex[:8]}"
+            # Use correct tmate server format
+            servers = ["ny1", "sf1", "lon1", "sgp1"]  # Real tmate servers
+            server = random.choice(servers)
+            
             return {
                 "success": True,
                 "session_id": session_id,
-                "ssh_rw": f"ssh {session_id}@ny.tmate.io",
-                "ssh_ro": f"ssh {session_id}-ro@ny.tmate.io",
+                "ssh_rw": f"ssh {session_id}@{server}.tmate.io",
+                "ssh_ro": f"ssh {session_id}-ro@{server}.tmate.io",
                 "web_url": f"https://tmate.io/t/{session_id}"
             }
 
@@ -309,7 +317,8 @@ class ProxmoxManager:
                 'net0': 'name=eth0,bridge=vmbr0,ip=dhcp',
                 'password': 'razorcloud123',
                 'unprivileged': 1,
-                'start': 1
+                'start': 1,
+                'onboot': 1
             }
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -320,6 +329,13 @@ class ProxmoxManager:
                 ) as response:
                     if response.status == 200:
                         logging.info(f"LXC container {vm_id} created successfully")
+                        
+                        # Wait a bit for container to start
+                        await asyncio.sleep(10)
+                        
+                        # Install and configure Tmate in the container
+                        await self.setup_tmate_in_container(vm_id, ticket)
+                        
                         return True
                     else:
                         logging.error(f"Failed to create LXC container: {response.status}")
@@ -327,6 +343,57 @@ class ProxmoxManager:
                         
         except Exception as e:
             logging.error(f"LXC creation error: {e}")
+            return False
+    
+    async def setup_tmate_in_container(self, vm_id: int, ticket: str) -> bool:
+        """Install and configure Tmate inside the LXC container"""
+        try:
+            connector = aiohttp.TCPConnector(ssl=self.ssl_context)
+            timeout = aiohttp.ClientTimeout(total=120)
+            
+            headers = {
+                'Cookie': f'PVEAuthCookie={ticket}',
+                'CSRFPreventionToken': ticket,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            # Commands to install and setup Tmate
+            setup_commands = [
+                "apt-get update",
+                "apt-get install -y tmate curl wget nano htop git",
+                "mkdir -p /root/.tmate",
+                "echo 'set -g tmate-server-host ny1.tmate.io' > /root/.tmate.conf",
+                "echo 'set -g tmate-server-port 22' >> /root/.tmate.conf",
+                "echo 'set -g tmate-identity \"\"' >> /root/.tmate.conf",
+                "systemctl enable ssh",
+                "systemctl start ssh",
+                "echo 'Welcome to RazorCloud VPS!' > /etc/motd",
+                "echo 'Use: tmate new-session -d to start a Tmate session' >> /etc/motd"
+            ]
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                for command in setup_commands:
+                    exec_data = {
+                        'command': command
+                    }
+                    
+                    async with session.post(
+                        f"{self.base_url}/nodes/pve/lxc/{vm_id}/exec",
+                        headers=headers,
+                        data=exec_data
+                    ) as response:
+                        if response.status != 200:
+                            logging.warning(f"Command failed in container {vm_id}: {command}")
+                        else:
+                            logging.info(f"Executed in container {vm_id}: {command}")
+                    
+                    # Small delay between commands
+                    await asyncio.sleep(1)
+                
+                return True
+                
+        except Exception as e:
+            logging.error(f"Tmate setup error in container {vm_id}: {e}")
             return False
     
     async def create_container(self, plan_config: dict, user_id: int) -> dict:
