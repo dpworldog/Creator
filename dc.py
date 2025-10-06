@@ -141,9 +141,7 @@ class TmateManager:
         """Create a REAL Tmate session and return actual working URLs"""
         try:
             import subprocess
-            import tempfile
             import os
-            import asyncio
             
             logging.info("🔄 Creating REAL Tmate session...")
             
@@ -151,84 +149,77 @@ class TmateManager:
             session_name = f"rzr-{uuid.uuid4().hex[:8]}"
             socket_path = f"/tmp/tmate-{session_name}.sock"
             
-            # Create script to start real tmate session
-            script_content = f"""#!/bin/bash
-set -e
-export TERM=xterm-256color
-
-# Kill any existing session
-pkill -f "tmate.*{session_name}" 2>/dev/null || true
-rm -f {socket_path} 2>/dev/null || true
-
-# Start new tmate session
-tmate -S {socket_path} new-session -d -s {session_name}
-
-# Wait for tmate to be ready (up to 30 seconds)
-for i in {{1..30}}; do
-    if tmate -S {socket_path} display -p '#{tmate_ssh}' 2>/dev/null | grep -q "ssh"; then
-        break
-    fi
-    sleep 1
-done
-
-# Get the connection info
-echo "SSH_RW=$(tmate -S {socket_path} display -p '#{tmate_ssh}')"
-echo "SSH_RO=$(tmate -S {socket_path} display -p '#{tmate_ssh_ro}')"  
-echo "WEB_URL=$(tmate -S {socket_path} display -p '#{tmate_web}')"
-"""
+            # Clean up any existing session
+            try:
+                subprocess.run(['pkill', '-f', f'tmate.*{session_name}'], 
+                             capture_output=True, timeout=5)
+                os.unlink(socket_path)
+            except:
+                pass
             
-            # Write script to temporary file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-                f.write(script_content)
-                script_path = f.name
-            
-            os.chmod(script_path, 0o755)
-            
-            # Execute the script
+            # Start new tmate session
             logging.info("📡 Starting Tmate session...")
-            result = subprocess.run(
-                ['bash', script_path], 
-                capture_output=True, 
-                text=True, 
-                timeout=45
-            )
             
-            # Clean up script
-            os.unlink(script_path)
+            # Step 1: Create the session
+            result1 = subprocess.run([
+                'tmate', '-S', socket_path, 'new-session', '-d', '-s', session_name
+            ], capture_output=True, text=True, timeout=15)
             
-            if result.returncode == 0 and result.stdout:
-                # Parse the output
-                output_lines = result.stdout.strip().split('\n')
-                ssh_rw = None
-                ssh_ro = None
-                web_url = None
-                
-                for line in output_lines:
-                    if line.startswith('SSH_RW='):
-                        ssh_rw = line.split('=', 1)[1]
-                    elif line.startswith('SSH_RO='):
-                        ssh_ro = line.split('=', 1)[1]
-                    elif line.startswith('WEB_URL='):
-                        web_url = line.split('=', 1)[1]
-                
-                if ssh_rw and ssh_ro and web_url:
-                    logging.info(f"✅ REAL Tmate session created!")
-                    logging.info(f"   SSH RW: {ssh_rw}")
-                    logging.info(f"   SSH RO: {ssh_ro}")
-                    logging.info(f"   Web: {web_url}")
+            if result1.returncode != 0:
+                raise Exception(f"Failed to create tmate session: {result1.stderr}")
+            
+            # Step 2: Wait for tmate to be ready
+            import time
+            for i in range(30):  # Wait up to 30 seconds
+                try:
+                    check_result = subprocess.run([
+                        'tmate', '-S', socket_path, 'display', '-p', '#{tmate_ssh}'
+                    ], capture_output=True, text=True, timeout=5)
                     
-                    return {
-                        "success": True,
-                        "session_id": session_name,
-                        "ssh_rw": ssh_rw,
-                        "ssh_ro": ssh_ro,
-                        "web_url": web_url,
-                        "socket_path": socket_path
-                    }
-                else:
-                    logging.warning("⚠️ Tmate session created but couldn't parse URLs")
+                    if check_result.returncode == 0 and 'ssh' in check_result.stdout:
+                        break
+                except:
+                    pass
+                time.sleep(1)
             else:
-                logging.warning(f"⚠️ Tmate command failed: {result.stderr}")
+                raise Exception("Tmate session did not become ready in time")
+            
+            # Step 3: Get the connection URLs
+            ssh_rw_result = subprocess.run([
+                'tmate', '-S', socket_path, 'display', '-p', '#{tmate_ssh}'
+            ], capture_output=True, text=True, timeout=10)
+            
+            ssh_ro_result = subprocess.run([
+                'tmate', '-S', socket_path, 'display', '-p', '#{tmate_ssh_ro}'
+            ], capture_output=True, text=True, timeout=10)
+            
+            web_result = subprocess.run([
+                'tmate', '-S', socket_path, 'display', '-p', '#{tmate_web}'
+            ], capture_output=True, text=True, timeout=10)
+            
+            if (ssh_rw_result.returncode == 0 and 
+                ssh_ro_result.returncode == 0 and 
+                web_result.returncode == 0):
+                
+                ssh_rw = ssh_rw_result.stdout.strip()
+                ssh_ro = ssh_ro_result.stdout.strip()
+                web_url = web_result.stdout.strip()
+                
+                logging.info(f"✅ REAL Tmate session created!")
+                logging.info(f"   SSH RW: {ssh_rw}")
+                logging.info(f"   SSH RO: {ssh_ro}")
+                logging.info(f"   Web: {web_url}")
+                
+                return {
+                    "success": True,
+                    "session_id": session_name,
+                    "ssh_rw": ssh_rw,
+                    "ssh_ro": ssh_ro,
+                    "web_url": web_url,
+                    "socket_path": socket_path
+                }
+            else:
+                raise Exception("Failed to get tmate connection URLs")
             
         except subprocess.TimeoutExpired:
             logging.warning("⏰ Tmate session creation timed out")
@@ -276,9 +267,9 @@ cd /root &&
 export TERM=xterm-256color && 
 tmate -S /tmp/tmate-{session_name}.sock new-session -d -s {session_name} && 
 sleep 5 && 
-tmate -S /tmp/tmate-{session_name}.sock display -p '#{tmate_ssh}' && 
-tmate -S /tmp/tmate-{session_name}.sock display -p '#{tmate_ssh_ro}' && 
-tmate -S /tmp/tmate-{session_name}.sock display -p '#{tmate_web}'
+tmate -S /tmp/tmate-{session_name}.sock display -p '#{{tmate_ssh}}' && 
+tmate -S /tmp/tmate-{session_name}.sock display -p '#{{tmate_ssh_ro}}' && 
+tmate -S /tmp/tmate-{session_name}.sock display -p '#{{tmate_web}}'
 """
             
             exec_data = {
