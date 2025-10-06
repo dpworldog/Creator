@@ -31,6 +31,7 @@ class Config:
     
     # VM Templates - Updated with new paid plans
     TEMPLATES = {
+        "test": {"ram": 1024, "cores": 1, "disk": 10, "price": 0, "hostname_prefix": "razor-test"},
         "starter": {"ram": 8096, "cores": 2, "disk": 80, "price": 8, "hostname_prefix": "razor-starter"},
         "business": {"ram": 16384, "cores": 4, "disk": 100, "price": 12, "hostname_prefix": "razor-business"},
         "professional": {"ram": 24638, "cores": 4, "disk": 150, "price": 16, "hostname_prefix": "razor-professional"},
@@ -369,22 +370,25 @@ class OxaPayHandler:
     
     async def create_invoice(self, amount: float, plan_name: str, user_id: int) -> dict:
         try:
-            # Generate invoice ID
-            invoice_id = f"RZR-{uuid.uuid4().hex[:8].upper()}"
+            # Generate unique order ID
+            order_id = f"RZR-{uuid.uuid4().hex[:8].upper()}"
             
-            # Prepare invoice data for OxaPay API
+            # Prepare invoice data for OxaPay API (correct format)
             invoice_data = {
                 "merchant": self.merchant_key,
-                "amount": amount,
+                "amount": float(amount),
                 "currency": "USD",
                 "lifeTime": 30,  # 30 minutes
                 "feePaidByPayer": 0,
                 "underPaidCover": 1,
-                "callbackUrl": "https://your-webhook-url.com/oxapay/callback",
+                "callbackUrl": f"https://api.razorcloud.com/webhook/oxapay/{order_id}",
                 "returnUrl": "https://razorcloud.com/payment/success",
-                "description": f"RazorCloud {plan_name.title()} Plan",
-                "orderId": invoice_id
+                "description": f"RazorCloud {plan_name.title()} VPS Plan - ${amount}",
+                "orderId": order_id,
+                "email": f"user{user_id}@razorcloud.com"  # Optional but recommended
             }
+            
+            logging.info(f"Creating OxaPay invoice: {invoice_data}")
             
             timeout = aiohttp.ClientTimeout(total=30)
             
@@ -392,33 +396,101 @@ class OxaPayHandler:
                 async with session.post(
                     f"{self.base_url}/merchants/request",
                     json=invoice_data,
+                    headers={
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    }
+                ) as response:
+                    
+                    response_text = await response.text()
+                    logging.info(f"OxaPay Response: Status={response.status}, Body={response_text}")
+                    
+                    if response.status == 200:
+                        try:
+                            data = await response.json()
+                            
+                            # Check if request was successful
+                            if data.get("result") == 100:  # Success code
+                                payment_url = data.get("payLink")
+                                track_id = data.get("trackId")
+                                
+                                if payment_url:
+                                    return {
+                                        "success": True,
+                                        "paymentUrl": payment_url,
+                                        "payment_url": payment_url,
+                                        "oxapay_id": track_id or order_id,
+                                        "invoice_id": order_id,
+                                        "track_id": track_id
+                                    }
+                                else:
+                                    return {
+                                        "success": False,
+                                        "error": "Payment URL not received from OxaPay"
+                                    }
+                            else:
+                                error_msg = data.get('message') or f"Error code: {data.get('result')}"
+                                return {
+                                    "success": False, 
+                                    "error": f"OxaPay API error: {error_msg}"
+                                }
+                        except json.JSONDecodeError:
+                            return {
+                                "success": False,
+                                "error": f"Invalid JSON response from OxaPay: {response_text}"
+                            }
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"HTTP {response.status}: {response_text}"
+                        }
+            
+        except Exception as e:
+            logging.error(f"OxaPay error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def verify_payment(self, track_id: str) -> dict:
+        """Verify payment status with OxaPay"""
+        try:
+            verify_data = {
+                "merchant": self.merchant_key,
+                "trackId": track_id
+            }
+            
+            timeout = aiohttp.ClientTimeout(total=30)
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/merchants/inquiry",
+                    json=verify_data,
                     headers={'Content-Type': 'application/json'}
                 ) as response:
                     
                     if response.status == 200:
                         data = await response.json()
                         
-                        if data.get("result") == 100:  # Success
+                        if data.get("result") == 100:
+                            status = data.get("status")  # 1 = paid, 0 = unpaid
                             return {
                                 "success": True,
-                                "paymentUrl": data.get("payLink"),
-                                "payment_url": data.get("payLink"),
-                                "oxapay_id": data.get("trackId", invoice_id),
-                                "invoice_id": invoice_id
+                                "paid": status == 1,
+                                "status": "paid" if status == 1 else "unpaid",
+                                "amount": data.get("amount"),
+                                "currency": data.get("currency")
                             }
                         else:
                             return {
-                                "success": False, 
-                                "error": f"OxaPay API error: {data.get('message', 'Unknown error')}"
+                                "success": False,
+                                "error": f"Verification failed: {data.get('message', 'Unknown error')}"
                             }
                     else:
                         return {
                             "success": False,
-                            "error": f"HTTP {response.status}: Failed to create payment"
+                            "error": f"HTTP {response.status}: Verification request failed"
                         }
-            
+                        
         except Exception as e:
-            logging.error(f"OxaPay error: {e}")
+            logging.error(f"Payment verification error: {e}")
             return {"success": False, "error": str(e)}
 
 # === DISCORD BOT ===
@@ -457,6 +529,9 @@ async def help(ctx):
     embed = create_razor_embed("Command Center", "Complete command reference for RazorCloud")
     
     commands_list = """
+    **🧪 Test VPS**
+    `!test` - Create free 1GB test VPS (1 per user)
+    
     **💎 VPS Plans**
     `!plans` - View all VPS plans
     `!buy starter` - Buy Starter plan ($8)
@@ -516,6 +591,89 @@ async def plans(ctx):
     
     await ctx.send(embed=embed)
 
+@bot.command()
+async def test(ctx):
+    """Create a free 1GB test VPS for testing purposes"""
+    
+    # Check if user already has a test VPS
+    cursor = bot.db.conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM vps_instances WHERE user_id = ? AND plan_name = "test"', (ctx.author.id,))
+    test_count = cursor.fetchone()[0]
+    
+    if test_count > 0:
+        await ctx.send("❌ You already have a test VPS. Each user can only have one test instance.")
+        return
+    
+    # Create user if not exists
+    bot.db.create_user(ctx.author)
+    
+    # Show deployment message
+    embed = create_razor_embed("Test VPS Deployment", "Creating your 1GB test VPS...", 0x00FF9D)
+    embed.add_field(name="📦 Plan", value="Test (1GB RAM)", inline=True)
+    embed.add_field(name="👤 User", value=ctx.author.display_name, inline=True)
+    embed.add_field(name="⏱️ Status", value="🟡 **DEPLOYING**", inline=True)
+    embed.add_field(name="ℹ️ Note", value="Test VPS is free but limited to 1 per user", inline=False)
+    
+    deployment_msg = await ctx.send(embed=embed)
+    
+    # Create test VPS
+    plan_config = Config.TEMPLATES["test"].copy()
+    plan_config['plan_name'] = "test"
+    result = await bot.proxmox.create_container(plan_config, ctx.author.id)
+    
+    if result["success"]:
+        # Save to database
+        bot.db.create_vps(
+            ctx.author.id,
+            result["vm_id"],
+            "test",
+            result["hostname"],
+            result["tmate_session"],
+            result["tmate_ro_session"]
+        )
+        
+        # Send success DM with credentials
+        success_embed = create_razor_embed("Test VPS Ready! 🧪", "Your test VPS is now active", 0x00FF00)
+        success_embed.add_field(name="🆔 VM ID", value=result["vm_id"], inline=True)
+        success_embed.add_field(name="🌐 Hostname", value=result["hostname"], inline=True)
+        success_embed.add_field(name="📦 Plan", value="Test (1GB)", inline=True)
+        
+        # Tmate sessions
+        success_embed.add_field(
+            name="🔑 Tmate Read-Write", 
+            value=f"```{result['tmate_session']}```",
+            inline=False
+        )
+        success_embed.add_field(
+            name="👀 Tmate Read-Only", 
+            value=f"```{result['tmate_ro_session']}```",
+            inline=False
+        )
+        success_embed.add_field(
+            name="🌐 Web Interface", 
+            value=f"[Click Here]({result['tmate_web']})",
+            inline=True
+        )
+        
+        success_embed.add_field(
+            name="⚠️ Test VPS Limitations",
+            value="• 1GB RAM, 1 vCPU, 10GB Storage\n• One per user only\n• For testing purposes",
+            inline=False
+        )
+        
+        try:
+            await ctx.author.send(embed=success_embed)
+            dm_status = "✅ Check your DMs for test VPS credentials!"
+        except:
+            dm_status = "❌ Could not send DM. Please enable DMs and use `!tmate` to get your sessions."
+        
+        # Update public message
+        embed = create_razor_embed("Test VPS Complete ✅", dm_status, 0x00FF00)
+        await deployment_msg.edit(embed=embed)
+        
+    else:
+        embed = create_razor_embed("Test VPS Failed ❌", result["error"], 0xFF0000)
+        await deployment_msg.edit(embed=embed)
 
 @bot.command()
 async def buy(ctx, plan_name: str = None):
@@ -533,6 +691,11 @@ async def buy(ctx, plan_name: str = None):
     # Check if plan exists
     if plan_name not in Config.TEMPLATES:
         await ctx.send("❌ Invalid plan name. Use `!plans` to see available plans.")
+        return
+    
+    # Don't allow buying test plan
+    if plan_name == "test":
+        await ctx.send("❌ Test plan is free. Use `!test` command instead.")
         return
     
     price = Config.TEMPLATES[plan_name]["price"]
@@ -638,6 +801,76 @@ async def verify(ctx, payment_id: str):
         
     else:
         embed = create_razor_embed("Deployment Failed ❌", result["error"], 0xFF0000)
+        await msg.edit(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def checkpayment(ctx, track_id: str):
+    """Admin command to check payment status with OxaPay"""
+    embed = create_razor_embed("Checking Payment...", f"Verifying payment status for {track_id}", 0x00FF9D)
+    msg = await ctx.send(embed=embed)
+    
+    # Verify payment with OxaPay
+    verification = await bot.oxapay.verify_payment(track_id)
+    
+    if verification["success"]:
+        if verification["paid"]:
+            # Payment confirmed, find and deploy VPS
+            cursor = bot.db.conn.cursor()
+            cursor.execute('SELECT user_id, plan_name FROM payments WHERE oxapay_id = ?', (track_id,))
+            payment_data = cursor.fetchone()
+            
+            if payment_data:
+                user_id, plan_name = payment_data
+                
+                # Deploy VPS
+                plan_config = Config.TEMPLATES[plan_name].copy()
+                plan_config['plan_name'] = plan_name
+                result = await bot.proxmox.create_container(plan_config, user_id)
+                
+                if result["success"]:
+                    # Save VPS to database
+                    bot.db.create_vps(
+                        user_id,
+                        result["vm_id"],
+                        plan_name,
+                        result["hostname"],
+                        result["tmate_session"],
+                        result["tmate_ro_session"]
+                    )
+                    
+                    # Update payment status
+                    cursor.execute('UPDATE payments SET status = "completed" WHERE oxapay_id = ?', (track_id,))
+                    bot.db.conn.commit()
+                    
+                    # Notify user
+                    user = await bot.fetch_user(user_id)
+                    success_embed = create_razor_embed("Payment Verified ✅", "Your VPS is ready!", 0x00FF00)
+                    success_embed.add_field(name="📦 Plan", value=plan_name.title(), inline=True)
+                    success_embed.add_field(name="🆔 VM ID", value=result["vm_id"], inline=True)
+                    success_embed.add_field(name="🔑 Tmate Session", value=f"`{result['tmate_session']}`", inline=False)
+                    
+                    await user.send(embed=success_embed)
+                    
+                    # Update admin message
+                    embed = create_razor_embed("Payment Verified & VPS Deployed ✅", 
+                                             f"VPS deployed for <@{user_id}>\nAmount: ${verification['amount']}", 0x00FF00)
+                    await msg.edit(embed=embed)
+                else:
+                    embed = create_razor_embed("Payment Verified but Deployment Failed ❌", 
+                                             f"Payment confirmed but VPS deployment failed: {result['error']}", 0xFF9900)
+                    await msg.edit(embed=embed)
+            else:
+                embed = create_razor_embed("Payment Verified but Order Not Found ❌", 
+                                         f"Payment confirmed but no matching order found for {track_id}", 0xFF9900)
+                await msg.edit(embed=embed)
+        else:
+            embed = create_razor_embed("Payment Not Completed ⏳", 
+                                     f"Payment {track_id} is still unpaid", 0xFFD700)
+            await msg.edit(embed=embed)
+    else:
+        embed = create_razor_embed("Payment Verification Failed ❌", 
+                                 f"Could not verify payment: {verification['error']}", 0xFF0000)
         await msg.edit(embed=embed)
 
 @bot.command()
