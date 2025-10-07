@@ -17,7 +17,7 @@ class Config:
     BOT_TOKEN = "Bot_Token"
     PROXMOX_HOST = "213.136.76.161"  # Your IP without https://
     PROXMOX_USER = "root@pam"
-    PROXMOX_PASSWORD = "darshv12"
+    PROXMOX_PASSWORD = "pass"
     PROXMOX_PORT = 8006
     OXAPAY_MERCHANT_KEY = "B7HMMV-NYIWDS-ISRA2C-1AQKCP"
     ADMIN_IDS = [1244619465040203850]  # Replace with admin user IDs
